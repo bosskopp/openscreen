@@ -89,6 +89,10 @@ export class LinuxNativeCaptureSession {
 	private stoppedReject: ((error: Error) => void) | null = null;
 
 	private sourceKind: LinuxCaptureSourceKind | undefined;
+	/** Wall clock of the first encoded frame — the recording's zero. */
+	private captureStartedAtMs: number | undefined;
+	/** Where the portal put the granted source, when it said. */
+	private grantedPositionValue: { x: number; y: number } | undefined;
 	private videoEncoder: string | undefined;
 	private lastError: string | null = null;
 	private paused = false;
@@ -263,6 +267,26 @@ export class LinuxNativeCaptureSession {
 	 * as "a screen", and callers must not collapse the two. Guessing is what this
 	 * whole field exists to stop.
 	 */
+	/**
+	 * The instant the recording's frame 0 was staged, on the wall clock.
+	 *
+	 * Exposed so a fallback cursor sampler can share the video's origin instead
+	 * of inventing its own — see the X11 fallback in `electron/ipc/handlers.ts`.
+	 * `undefined` until the helper reports `capture-started`.
+	 */
+	get startedAtMs(): number | undefined {
+		return this.captureStartedAtMs;
+	}
+
+	/**
+	 * Top-left of the granted source in the compositor's LOGICAL coordinates —
+	 * the same space Electron's `screen` API uses, and NOT the negotiated pixel
+	 * size, which differs on a scaled display.
+	 */
+	get grantedPosition(): { x: number; y: number } | undefined {
+		return this.grantedPositionValue;
+	}
+
 	get grantedSourceKind(): LinuxCaptureSourceKind | undefined {
 		return this.sourceKind;
 	}
@@ -360,6 +384,9 @@ export class LinuxNativeCaptureSession {
 				if (payload.sourceKind) {
 					this.sourceKind = payload.sourceKind;
 				}
+				if (typeof payload.positionX === "number" && typeof payload.positionY === "number") {
+					this.grantedPositionValue = { x: payload.positionX, y: payload.positionY };
+				}
 				this.sourceSelected = true;
 				console.info(
 					"[capture-linux] source selected",
@@ -422,6 +449,7 @@ export class LinuxNativeCaptureSession {
 				// telemetry is re-based onto it and anything from during the
 				// picker is dropped rather than left pinned to the start.
 				this.cursor.rebase(payload.timestampMs);
+				this.captureStartedAtMs = payload.timestampMs;
 				console.info(
 					"[capture-linux] capture started",
 					JSON.stringify({ width: payload.width, height: payload.height, fps: payload.fps }),
