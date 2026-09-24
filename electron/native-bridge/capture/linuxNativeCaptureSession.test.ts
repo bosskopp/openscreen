@@ -491,3 +491,71 @@ describe("LinuxNativeCaptureSession", () => {
 		expect(settled).toBe(true);
 	});
 });
+
+describe("what a fallback cursor sampler needs from the session", () => {
+	it("reports the recording's zero, so a second track can share it", async () => {
+		const session = newSession();
+		await startReady(session);
+		expect(session.startedAtMs).toBeUndefined();
+
+		helper.emitEvent({
+			event: "stream-started",
+			timestampMs: 1_100,
+			nodeId: 7,
+			width: 800,
+			height: 600,
+			sourceKind: "monitor",
+		});
+		helper.emitEvent({
+			event: "capture-started",
+			timestampMs: 1_234,
+			path: "/tmp/recording.mp4",
+			width: 800,
+			height: 600,
+			fps: 30,
+		});
+		await flushStdout();
+
+		// The same instant the accumulator rebases onto. A sampler that picked
+		// its own `Date.now()` would sit a portal-negotiation's worth of time
+		// away from frame 0, which is exactly the offset the rebase removes.
+		expect(session.startedAtMs).toBe(1_234);
+	});
+
+	it("reports where the portal put the source, in logical coordinates", async () => {
+		const session = newSession();
+		await startReady(session);
+
+		helper.emitEvent({
+			event: "source-selected",
+			timestampMs: 1_050,
+			nodeId: 7,
+			sourceKind: "monitor",
+			positionX: 2560,
+			positionY: 0,
+		});
+		await flushStdout();
+
+		// A second display to the right of the primary. Picking the display that
+		// contains this point is what keeps the fallback normalising against the
+		// monitor being recorded rather than the one the pointer starts on.
+		expect(session.grantedPosition).toEqual({ x: 2560, y: 0 });
+	});
+
+	it("leaves the position unknown when the portal does not report one", async () => {
+		const session = newSession();
+		await startReady(session);
+
+		helper.emitEvent({
+			event: "source-selected",
+			timestampMs: 1_050,
+			nodeId: 7,
+			sourceKind: "monitor",
+		});
+		await flushStdout();
+
+		// Absent is not (0,0): the primary display's own origin is (0,0), so
+		// guessing it would silently normalise against the wrong monitor.
+		expect(session.grantedPosition).toBeUndefined();
+	});
+});

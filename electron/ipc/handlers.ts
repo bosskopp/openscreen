@@ -75,6 +75,7 @@ import {
 	type LinuxCaptureSourceKind,
 	LinuxNativeCaptureSession,
 } from "../native-bridge/capture/linuxNativeCaptureSession";
+import { chooseCursorTrack } from "../native-bridge/cursor/recording/chooseCursorTrack";
 import { createCursorRecordingSession } from "../native-bridge/cursor/recording/factory";
 import {
 	isMacCursorHelperUnavailable,
@@ -82,6 +83,7 @@ import {
 } from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
 import { findPipeWireCursorHelperPath } from "../native-bridge/cursor/recording/pipeWireCursorRecordingSession";
 import type { CursorRecordingSession } from "../native-bridge/cursor/recording/session";
+import { TelemetryRecordingSession } from "../native-bridge/cursor/recording/telemetryRecordingSession";
 import { toHelperRect } from "../native-bridge/helperCoordinates";
 import {
 	isMacPickerSourceId,
@@ -825,6 +827,28 @@ let nativeMacStopInFlight = false;
 // Global frame of the region captured by the SCK helper (see getSelectedSourceBounds).
 let activeMacCaptureBounds: Rectangle | null = null;
 let linuxNativeCaptureSession: LinuxNativeCaptureSession | null = null;
+/**
+ * Cursor sampler used when the portal's METADATA cursor is a dead end.
+ *
+ * WHY THIS EXISTS. On X11, mutter ships a `SPA_META_Cursor` block for a MONITOR
+ * stream and never validates it: `id` stays 0, which the spec defines as
+ * "nothing new", so every sample is skipped and a full-screen recording comes
+ * back with no cursor at all. The same compositor populates it correctly for a
+ * WINDOW stream — measured on GNOME/X11, 217 samples for a window against 0 for
+ * a monitor, from the same helper in the same session.
+ *
+ * Nothing in the portal can fix that, but X11 will simply answer the question:
+ * `screen.getCursorScreenPoint()` is real there, and returns {0,0} only under
+ * Wayland (which is why `TelemetryRecordingSession` exists but is unreachable on
+ * Linux). So on X11 we run it ALONGSIDE the helper and keep whichever produced
+ * samples — the portal's when it has them, since those carry cursor bitmaps and
+ * follow a moving window, and this one when it has none.
+ *
+ * Deliberately NOT started on Wayland: there the portal is the only source of a
+ * pointer, and a sampler that can only return {0,0} would replace an empty track
+ * with a track pinned to the top-left corner, which is worse.
+ */
+let linuxX11CursorFallback: CursorRecordingSession | null = null;
 let linuxNativeCaptureRecordingId: number | null = null;
 let linuxNativeCaptureCursorMode: CursorCaptureMode = "editable-overlay";
 /** What the portal granted for the running capture, for the tray's label. */
@@ -1282,6 +1306,58 @@ async function startCursorRecording(recordingId?: number) {
 	} catch (error) {
 		console.error("Failed to start cursor recording session:", error);
 		cursorRecordingSession = null;
+	}
+}
+
+/** X11 lets us read the pointer; Wayland does not. */
+function isX11Session() {
+	return process.platform === "linux" && process.env.XDG_SESSION_TYPE === "x11";
+}
+
+/**
+ * Starts the X11 fallback sampler for a native capture, if it can help.
+ *
+ * `startedAtMs` is the helper's own `capture-started`, so both tracks share the
+ * video's zero rather than each picking their own — the whole reason the
+ * accumulator rebases.
+ */
+async function startLinuxX11CursorFallback(session: LinuxNativeCaptureSession) {
+	if (!isX11Session()) {
+		return;
+	}
+	const position = session.grantedPosition;
+	const options = {
+		// The portal reports where it put the source; the display containing
+		// that point is the one being recorded. Falling back to null lets
+		// TelemetryRecordingSession use the display the cursor is on, which is
+		// right for the single-monitor case and the best guess otherwise.
+		getDisplayBounds: () => (position ? screen.getDisplayNearestPoint(position).bounds : null),
+		maxSamples: MAX_CURSOR_SAMPLES,
+		sampleIntervalMs: CURSOR_SAMPLE_INTERVAL_MS,
+		...(typeof session.startedAtMs === "number" ? { startTimeMs: session.startedAtMs } : {}),
+	};
+	const fallback = new TelemetryRecordingSession(options);
+	try {
+		await fallback.start();
+		linuxX11CursorFallback = fallback;
+	} catch (error) {
+		console.error("[native-linux] X11 cursor fallback failed to start:", error);
+		linuxX11CursorFallback = null;
+	}
+}
+
+/** Stops the fallback and returns what it collected, or null. */
+async function stopLinuxX11CursorFallback(): Promise<CursorRecordingData | null> {
+	const fallback = linuxX11CursorFallback;
+	linuxX11CursorFallback = null;
+	if (!fallback) {
+		return null;
+	}
+	try {
+		return await fallback.stop();
+	} catch (error) {
+		console.error("[native-linux] X11 cursor fallback failed to stop:", error);
+		return null;
 	}
 }
 
@@ -2561,6 +2637,11 @@ export function registerIpcHandlers(
 				linuxNativeCaptureSession = session;
 				linuxNativeCaptureRecordingId = recordingId;
 				linuxNativeCaptureCursorMode = cursorCaptureMode;
+				// After `waitUntilCapturing`, so the helper's own zero is known and
+				// both cursor tracks can share it. Only does anything on X11.
+				if (cursorCaptureMode === "editable-overlay") {
+					await startLinuxX11CursorFallback(session);
+				}
 
 				// The portal's answer, not an in-app selection — on Wayland there
 				// is none to have. This used to read `selectedSource || { name:
@@ -2610,6 +2691,7 @@ export function registerIpcHandlers(
 		try {
 			if (discard) {
 				session.discard();
+				await stopLinuxX11CursorFallback();
 				const discarded = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
 				await Promise.all([
 					fs.rm(discarded, { force: true }),
@@ -2621,14 +2703,26 @@ export function registerIpcHandlers(
 			const result = await session.stop();
 
 			// The helper collects cursor samples itself, from the same portal
-			// session that produced the pixels, so there is no separate sampler
-			// to stop and no clock offset to correct — the two are one recording.
-			if (cursorCaptureMode === "editable-overlay" && result.cursor.samples.length > 0) {
-				await fs.writeFile(
-					`${result.path}.cursor.json`,
-					JSON.stringify(result.cursor, null, 2),
-					"utf-8",
+			// session that produced the pixels, so there is no clock offset to
+			// correct — the two are one recording. The X11 fallback shares that
+			// same zero (see startLinuxX11CursorFallback), so neither does it.
+			const fallbackCursor = await stopLinuxX11CursorFallback();
+			const { track: cursor, source: cursorSource } = chooseCursorTrack(
+				result.cursor,
+				fallbackCursor,
+			);
+			if (cursorSource === "x11-fallback") {
+				console.info(
+					"[native-linux] portal reported no cursor; using the X11 fallback",
+					JSON.stringify({
+						samples: cursor.samples.length,
+						sourceKind: result.sourceKind ?? null,
+					}),
 				);
+			}
+
+			if (cursorCaptureMode === "editable-overlay" && cursor.samples.length > 0) {
+				await fs.writeFile(`${result.path}.cursor.json`, JSON.stringify(cursor, null, 2), "utf-8");
 			}
 
 			const session_: RecordingSession = {
@@ -2652,7 +2746,8 @@ export function registerIpcHandlers(
 				droppedFrames: result.droppedFrames,
 				durationMs: result.durationMs,
 				videoEncoder: result.videoEncoder,
-				cursorSamples: result.cursor.samples.length,
+				cursorSamples: cursor.samples.length,
+				cursorSource,
 			});
 
 			return {
@@ -2665,6 +2760,10 @@ export function registerIpcHandlers(
 			console.error("Failed to stop native Linux recording:", error);
 			return { success: false, error: String(error) };
 		} finally {
+			// Belt and braces: the success path already stopped it, and this
+			// catches the throw-before-stop case. A leaked sampler is a timer
+			// that keeps firing into the next recording.
+			await stopLinuxX11CursorFallback();
 			linuxNativeCaptureSession = null;
 			linuxNativeCaptureRecordingId = null;
 			linuxNativeCaptureCursorMode = "editable-overlay";
