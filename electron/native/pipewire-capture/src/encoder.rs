@@ -6,11 +6,26 @@
 //! machine's GPU cannot run, so the only honest capability probe is to open the
 //! encoder with the real parameters and see what happens.
 //!
-//!   1. VAAPI   — the broadest hardware path on Linux (AMD, Intel, and NVIDIA
-//!                through nvidia-vaapi-driver).
-//!   2. Vulkan  — VK_KHR_video_encode_queue. Newer, and on RADV it needs
+//!   1. NVENC   — NVIDIA's dedicated encode block, through `h264_nvenc`.
+//!   2. VAAPI   — the broadest hardware path on Linux (AMD and Intel).
+//!   3. Vulkan  — VK_KHR_video_encode_queue. Newer, and on RADV it needs
 //!                `RADV_PERFTEST=video_encode`; see [`prepare_environment`].
-//!   3. libopenh264 — software. Always available, always last.
+//!   4. libopenh264 — software. Always available, always last.
+//!
+//! WHY NVENC COMES FIRST, AND WHY VAAPI NO LONGER CLAIMS NVIDIA. The ladder used
+//! to reach NVIDIA "through nvidia-vaapi-driver", which cannot encode: that shim
+//! is NVDEC-backed and implements the decode entrypoints only. So on an NVIDIA
+//! machine VAAPI was never going to open, and the recording fell through to
+//! Vulkan video encode — a far younger path — while the card's dedicated encode
+//! silicon sat idle. NVENC needs no VAAPI stack, no `nvidia-vaapi-driver`, and no
+//! `libva` at all; it talks to `libnvidia-encode.so`, which ships with the
+//! driver that is already installed on any machine that could use it.
+//!
+//! It is FIRST rather than after VAAPI because the two never both apply: a
+//! machine with NVENC has an NVIDIA GPU, and VAAPI has no encoder there. Putting
+//! it first means the common NVIDIA case stops paying for two failed probes,
+//! and an AMD/Intel machine pays only one extra `avcodec_open2` that fails
+//! immediately with no device.
 //!
 //! WHY VAAPI IS GUARDED BY A dlsym. The vendored ffmpeg 8.1 calls `vaMapBuffer2`,
 //! which libva only grew in 2.22. On a system with an older libva (Ubuntu 24.04
@@ -28,6 +43,7 @@ use crate::ffmpeg as ff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    Nvenc,
     Vaapi,
     Vulkan,
     Software,
@@ -50,6 +66,7 @@ impl Backend {
     /// vocabulary as the Windows helper's `encoder-selection` event.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Nvenc => "nvenc",
             Self::Vaapi => "vaapi",
             Self::Vulkan => "vulkan",
             Self::Software => "software",
@@ -58,17 +75,25 @@ impl Backend {
 
     fn codec_name(self) -> &'static CStr {
         match self {
+            Self::Nvenc => c"h264_nvenc",
             Self::Vaapi => c"h264_vaapi",
             Self::Vulkan => c"h264_vulkan",
             Self::Software => c"libopenh264",
         }
     }
 
+    /// `None` means the codec takes ordinary software frames.
+    ///
+    /// NVENC is hardware but answers `None`, which is not an oversight: unlike
+    /// VAAPI and Vulkan it accepts an `AVFrame` in system memory and does the
+    /// upload itself, so there is no hardware frames context to build and no
+    /// `av_hwframe_transfer_data` on the hot path. It rides the same staging
+    /// route as the software encoder and differs only in taking NV12.
     fn hw_device_type(self) -> Option<ff::AVHWDeviceType> {
         match self {
             Self::Vaapi => Some(ff::AV_HWDEVICE_TYPE_VAAPI),
             Self::Vulkan => Some(ff::AV_HWDEVICE_TYPE_VULKAN),
-            Self::Software => None,
+            Self::Nvenc | Self::Software => None,
         }
     }
 
@@ -78,6 +103,8 @@ impl Backend {
         match self {
             Self::Vaapi => ff::AV_PIX_FMT_VAAPI,
             Self::Vulkan => ff::AV_PIX_FMT_VULKAN,
+            // Not an opaque handle: NVENC is handed the pixels directly.
+            Self::Nvenc => ff::AV_PIX_FMT_NV12,
             Self::Software => ff::AV_PIX_FMT_YUV420P,
         }
     }
@@ -87,7 +114,7 @@ impl Backend {
         match self {
             // Every VCN/QuickSync/NVENC block wants NV12; YUV420P would force
             // ffmpeg into an extra internal conversion on upload.
-            Self::Vaapi | Self::Vulkan => ff::AV_PIX_FMT_NV12,
+            Self::Vaapi | Self::Vulkan | Self::Nvenc => ff::AV_PIX_FMT_NV12,
             Self::Software => ff::AV_PIX_FMT_YUV420P,
         }
     }
@@ -95,7 +122,8 @@ impl Backend {
 
 /// Order of preference. Public so the probe can be driven from a test or from
 /// `OPENSCREEN_LINUX_ENCODER` without duplicating the list.
-pub const LADDER: [Backend; 3] = [Backend::Vaapi, Backend::Vulkan, Backend::Software];
+pub const LADDER: [Backend; 4] =
+    [Backend::Nvenc, Backend::Vaapi, Backend::Vulkan, Backend::Software];
 
 /// Must run before anything creates a Vulkan instance — which, in this process,
 /// means before the first `av_hwdevice_ctx_create`.
@@ -1265,11 +1293,12 @@ pub fn forced_backend_from_env() -> Result<Option<Backend>, String> {
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(None),
+        "nvenc" | "nvidia" => Ok(Some(Backend::Nvenc)),
         "vaapi" => Ok(Some(Backend::Vaapi)),
         "vulkan" => Ok(Some(Backend::Vulkan)),
         "software" | "openh264" | "libopenh264" => Ok(Some(Backend::Software)),
         other => Err(format!(
-            "OPENSCREEN_LINUX_ENCODER={other} is not one of auto, vaapi, vulkan, software"
+            "OPENSCREEN_LINUX_ENCODER={other} is not one of auto, nvenc, vaapi, vulkan, software"
         )),
     }
 }
@@ -1356,8 +1385,44 @@ mod tests {
         assert!(error.contains("vulcan"), "{error}");
         std::env::set_var("OPENSCREEN_LINUX_ENCODER", "vaapi");
         assert_eq!(forced_backend_from_env().unwrap(), Some(Backend::Vaapi));
+        std::env::set_var("OPENSCREEN_LINUX_ENCODER", "nvenc");
+        assert_eq!(forced_backend_from_env().unwrap(), Some(Backend::Nvenc));
+        // The name people reach for when they do not know ffmpeg's.
+        std::env::set_var("OPENSCREEN_LINUX_ENCODER", "NVIDIA");
+        assert_eq!(forced_backend_from_env().unwrap(), Some(Backend::Nvenc));
         std::env::remove_var("OPENSCREEN_LINUX_ENCODER");
         assert_eq!(forced_backend_from_env().unwrap(), None);
+    }
+
+    /// NVENC is hardware that takes SOFTWARE frames. Everything downstream keys
+    /// off `hw_device_type()`: a `Some` builds a frames context and puts an
+    /// `av_hwframe_transfer_data` on every frame. Answering `Some` here would
+    /// ask ffmpeg for a CUDA frames context the encoder never wanted.
+    #[test]
+    fn nvenc_is_staged_as_software_frames_in_nv12() {
+        assert_eq!(Backend::Nvenc.hw_device_type(), None);
+        assert_eq!(Backend::Nvenc.codec_pixel_format(), ff::AV_PIX_FMT_NV12);
+        assert_eq!(Backend::Nvenc.upload_format(), ff::AV_PIX_FMT_NV12);
+        // The contrast that makes the point: a real hardware-frames backend.
+        assert!(Backend::Vaapi.hw_device_type().is_some());
+        assert_eq!(Backend::Vaapi.codec_pixel_format(), ff::AV_PIX_FMT_VAAPI);
+    }
+
+    /// The ladder tries NVENC before VAAPI, and software stays last.
+    ///
+    /// Ordering is the whole substance of this change on an NVIDIA machine, so
+    /// it is pinned rather than left to whoever next edits the array.
+    #[test]
+    fn the_ladder_prefers_dedicated_hardware_and_ends_in_software() {
+        assert_eq!(
+            LADDER,
+            [Backend::Nvenc, Backend::Vaapi, Backend::Vulkan, Backend::Software]
+        );
+        assert_eq!(
+            *LADDER.last().expect("ladder is not empty"),
+            Backend::Software,
+            "software must remain the fallback of last resort"
+        );
     }
 
     /// The whole pipeline — ladder, encode, mux — against a real file, with no
@@ -1436,3 +1501,4 @@ mod tests {
         std::env::remove_var("RADV_PERFTEST");
     }
 }
+
